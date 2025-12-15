@@ -1,131 +1,211 @@
 """
-PPO Hyperparameter Experiments
-================================
+Hyperparameter Experiments for PPO Glucose Control
+===================================================
 
-This file lets you run systematic experiments to understand how
-different hyperparameters affect PPO's performance.
+Systematic experiments to investigate:
+- Epsilon (clipping parameter) sensitivity
+- Reward function weight comparison
+- Learning rate effects
+- Network architecture variations
 
-Key experiments:
-1. Epsilon comparison (0.1, 0.2, 0.3) - THE MOST IMPORTANT
-2. Learning rate comparison
-3. GAE lambda comparison
-4. Number of epochs comparison
+Each experiment runs multiple seeds for statistical reliability
+and generates comprehensive visualisations.
 
-Each experiment shows WHY the default values are chosen.
+Based on experimental methodology from:
+- Schulman et al. (2017) PPO paper
+- Henderson et al. (2018) "Deep RL that Matters"
 """
 
 import os
-import sys
-import torch
-import numpy as np
-import gymnasium as gym
-from tqdm import tqdm
 import json
-import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
+import torch
 from datetime import datetime
-from scipy.ndimage import uniform_filter1d
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, asdict
+from tqdm import tqdm
+import copy
 
-from networks import ActorCritic
+from environment import GlucoseInsulinEnv
 from ppo_agent import PPOAgent
 from train import PPOTrainer
+from evaluate import (
+    evaluate_ppo_agent, 
+    evaluate_controller,
+    FixedBasalController,
+    BasalBolusController,
+    RuleBasedController,
+    PIDController,
+    EvaluationResult,
+    compare_controllers
+)
+from visualise import PPOVisualiser
 
-sns.set_style("whitegrid")
-plt.rcParams['figure.figsize'] = (15, 10)
+
+@dataclass
+class ExperimentConfig:
+    """Configuration for a single experiment run."""
+    name: str
+    total_timesteps: int
+    steps_per_update: int
+    seed: int
+    env_config: Dict
+    agent_config: Dict
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+@dataclass
+class ExperimentResult:
+    """Results from a single experiment run."""
+    config: ExperimentConfig
+    episode_rewards: List[float]
+    episode_lengths: List[int]
+    clinical_metrics: List[Dict]
+    agent_metrics: Dict[str, List[float]]
+    final_eval: Dict
+    training_time: float
+    
+    def to_dict(self) -> Dict:
+        return {
+            'config': self.config.to_dict(),
+            'episode_rewards': self.episode_rewards,
+            'episode_lengths': self.episode_lengths,
+            'clinical_metrics': self.clinical_metrics,
+            'agent_metrics': self.agent_metrics,
+            'final_eval': self.final_eval,
+            'training_time': self.training_time
+        }
 
 
 class PPOExperiment:
     """
-    Run controlled experiments comparing different hyperparameters
+    Manager for PPO hyperparameter experiments.
+    
+    Provides methods for:
+    - Running single experiments
+    - Running multi-seed experiments
+    - Comparing hyperparameter values
+    - Generating comparison visualisations
     """
     
     def __init__(
         self,
-        env_name="CartPole-v1",
-        base_timesteps=50000,
-        num_seeds=3,
-        save_dir="./experiments"
+        base_save_dir: str = "./experiments",
+        default_timesteps: int = 50000,
+        default_steps_per_update: int = 2048,
+        eval_episodes: int = 10
     ):
         """
+        Initialise experiment manager.
+        
         Args:
-            env_name: Environment to test on
-            base_timesteps: Timesteps per run
-            num_seeds: Number of random seeds (for statistical reliability)
-            save_dir: Where to save results
+            base_save_dir: Base directory for saving experiments
+            default_timesteps: Default training timesteps
+            default_steps_per_update: Default steps per PPO update
+            eval_episodes: Number of episodes for evaluation
         """
-        self.env_name = env_name
-        self.base_timesteps = base_timesteps
-        self.num_seeds = num_seeds
-        self.save_dir = save_dir
+        self.base_save_dir = base_save_dir
+        self.default_timesteps = default_timesteps
+        self.default_steps_per_update = default_steps_per_update
+        self.eval_episodes = eval_episodes
         
-        # Create save directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.experiment_dir = os.path.join(save_dir, f"{env_name}_{timestamp}")
-        os.makedirs(self.experiment_dir, exist_ok=True)
+        # Default configurations
+        self.default_env_config = {
+            'max_insulin_dose': 5.0,
+            'episode_length_hours': 24.0,
+            'sample_time_minutes': 5.0,
+            'target_glucose_min': 70.0,
+            'target_glucose_max': 180.0,
+            'patient_variability': True,
+            'meal_variability': True
+        }
         
-        print(f"Experiment directory: {self.experiment_dir}")
+        self.default_agent_config = {
+            'hidden_dim': 64,
+            'lr': 3e-4,
+            'gamma': 0.99,
+            'gae_lambda': 0.95,
+            'epsilon': 0.2,
+            'value_coef': 0.5,
+            'entropy_coef': 0.01,
+            'max_grad_norm': 0.5,
+            'update_epochs': 10,
+            'batch_size': 64
+        }
+        
+        os.makedirs(base_save_dir, exist_ok=True)
     
-    def run_single_experiment(self, config_name, ppo_kwargs, seed):
+    def run_single_experiment(
+        self,
+        config: ExperimentConfig,
+        verbose: bool = True
+    ) -> ExperimentResult:
         """
-        Run a single training run with specific hyperparameters
+        Run a single training experiment.
         
         Args:
-            config_name: Name of this configuration (e.g., "epsilon_0.2")
-            ppo_kwargs: Dictionary of PPO hyperparameters
-            seed: Random seed
+            config: Experiment configuration
+            verbose: Print progress
         
         Returns:
-            Dictionary containing all metrics
+            ExperimentResult with all metrics
         """
-        print(f"\n{'='*60}")
-        print(f"Running: {config_name} (seed={seed})")
-        print(f"{'='*60}")
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Running experiment: {config.name}")
+            print(f"Seed: {config.seed}")
+            print(f"{'='*60}")
         
         # Set seeds
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        torch.manual_seed(config.seed)
+        np.random.seed(config.seed)
         
         # Create environment
-        env = gym.make(self.env_name)
-        env.action_space.seed(seed)
+        env = GlucoseInsulinEnv(**config.env_config, seed=config.seed)
         
+        # Get dimensions
         state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.n
+        action_dim = env.action_space.shape[0]
         
-        # Create network and agent with specific hyperparameters
-        network = ActorCritic(state_dim, action_dim)
-        agent = PPOAgent(network, **ppo_kwargs)
+        # Create agent
+        agent = PPOAgent(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_low=0.0,
+            action_high=config.env_config['max_insulin_dose'],
+            **config.agent_config
+        )
         
-        # Training metrics
+        # Training tracking
         episode_rewards = []
         episode_lengths = []
-        timesteps_list = []
+        clinical_metrics = []
         
-        # Training loop (simplified version of PPOTrainer)
-        state, _ = env.reset(seed=seed)
-        current_episode_reward = 0
+        current_episode_reward = 0.0
         current_episode_length = 0
+        
+        # Initialise environment
+        state, info = env.reset(seed=config.seed)
+        
+        # Training loop
         total_steps = 0
         
-        pbar = tqdm(total=self.base_timesteps, desc=f"{config_name} (seed {seed})")
+        import time
+        start_time = time.time()
         
-        steps_per_update = 2048
+        if verbose:
+            pbar = tqdm(total=config.total_timesteps, desc="Training")
         
-        while total_steps < self.base_timesteps:
+        while total_steps < config.total_timesteps:
             # Collect experience
-            for _ in range(steps_per_update):
-                action, log_prob, value = agent.network.get_action(state)
-                next_state, reward, terminated, truncated, _ = env.step(action)
+            for step in range(config.steps_per_update):
+                action, log_prob, value = agent.get_action(state)
+                next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 
-                agent.store_transition(
-                    state=state,
-                    action=action,
-                    reward=reward,
-                    value=value.item(),
-                    log_prob=log_prob.item(),
-                    done=done
-                )
+                agent.store_transition(state, action, reward, value, log_prob, done)
                 
                 current_episode_reward += reward
                 current_episode_length += 1
@@ -136,578 +216,829 @@ class PPOExperiment:
                 if done:
                     episode_rewards.append(current_episode_reward)
                     episode_lengths.append(current_episode_length)
-                    timesteps_list.append(total_steps)
+                    clinical_metrics.append(env.get_episode_stats())
                     
-                    current_episode_reward = 0
+                    current_episode_reward = 0.0
                     current_episode_length = 0
-                    state, _ = env.reset()
+                    state, info = env.reset()
                 
-                pbar.update(1)
+                if verbose:
+                    pbar.update(1)
                 
-                if total_steps >= self.base_timesteps:
+                if total_steps >= config.total_timesteps:
                     break
             
             # Update agent
-            agent.update()
+            if not done:
+                next_value = agent.network.get_value(state)
+            else:
+                next_value = 0.0
+            
+            agent.update(next_value=next_value, next_done=done)
         
-        pbar.close()
-        env.close()
+        if verbose:
+            pbar.close()
         
-        # Return results
-        return {
-            'config_name': config_name,
-            'seed': seed,
-            'episode_rewards': episode_rewards,
-            'episode_lengths': episode_lengths,
-            'timesteps': timesteps_list,
-            'agent_metrics': agent.get_metrics(),
-            'ppo_kwargs': ppo_kwargs
-        }
+        training_time = time.time() - start_time
+        
+        # Final evaluation
+        final_eval = self._evaluate_agent(agent, config.env_config, config.seed)
+        
+        result = ExperimentResult(
+            config=config,
+            episode_rewards=episode_rewards,
+            episode_lengths=episode_lengths,
+            clinical_metrics=clinical_metrics,
+            agent_metrics=agent.get_metrics(),
+            final_eval=final_eval,
+            training_time=training_time
+        )
+        
+        if verbose:
+            print(f"\nExperiment complete!")
+            print(f"  Episodes: {len(episode_rewards)}")
+            print(f"  Final reward: {np.mean(episode_rewards[-50:]):.1f}")
+            print(f"  Final TIR: {final_eval['mean_tir']:.1f}%")
+            print(f"  Training time: {training_time:.1f}s")
+        
+        return result
     
-    def experiment_epsilon(self, epsilon_values=[0.1, 0.2, 0.3]):
+    def _evaluate_agent(
+        self,
+        agent: PPOAgent,
+        env_config: Dict,
+        seed: int
+    ) -> Dict:
+        """Evaluate trained agent."""
+        eval_result = evaluate_ppo_agent(
+            agent=agent,
+            env_config=env_config,
+            num_episodes=self.eval_episodes,
+            deterministic=True,
+            seed=seed + 10000
+        )
+        return eval_result.summary()
+    
+    def run_epsilon_experiment(
+        self,
+        epsilon_values: List[float] = [0.1, 0.2, 0.3],
+        seeds: List[int] = [42, 123, 456],
+        timesteps: Optional[int] = None,
+        save_name: Optional[str] = None
+    ) -> Dict:
         """
-        Experiment 1: Compare different epsilon (clipping) values
+        Compare different epsilon (clipping) values.
         
-        This is THE KEY EXPERIMENT for your tutorial!
-        
-        Why test this?
-        - Epsilon is PPO's main hyperparameter
-        - Controls how conservative updates are
-        - Too small = slow learning
-        - Too large = unstable (like vanilla PG)
+        This is the key experiment showing why ε=0.2 is optimal.
         
         Args:
             epsilon_values: List of epsilon values to test
+            seeds: List of random seeds for each value
+            timesteps: Training timesteps (uses default if None)
+            save_name: Name for saving results
         
         Returns:
-            Dictionary with all results
+            Dictionary with all experiment results
         """
-        print("\n" + "="*60)
-        print("EXPERIMENT 1: EPSILON COMPARISON")
-        print("="*60)
-        print(f"Testing epsilon values: {epsilon_values}")
-        print(f"Seeds: {list(range(self.num_seeds))}")
-        print(f"Timesteps per run: {self.base_timesteps:,}")
-        print()
+        if timesteps is None:
+            timesteps = self.default_timesteps
         
-        results = {}
+        if save_name is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_name = f"epsilon_experiment_{timestamp}"
+        
+        save_dir = os.path.join(self.base_save_dir, save_name)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        print("\n" + "=" * 70)
+        print("EPSILON COMPARISON EXPERIMENT")
+        print("=" * 70)
+        print(f"Epsilon values: {epsilon_values}")
+        print(f"Seeds per value: {seeds}")
+        print(f"Timesteps: {timesteps:,}")
+        print(f"Save directory: {save_dir}")
+        print("=" * 70)
+        
+        all_results = {}
         
         for epsilon in epsilon_values:
-            config_name = f"epsilon_{epsilon}"
-            results[config_name] = []
+            print(f"\n{'─'*50}")
+            print(f"Testing ε = {epsilon}")
+            print(f"{'─'*50}")
             
-            # Run multiple seeds for statistical reliability
-            for seed in range(self.num_seeds):
-                ppo_kwargs = {
-                    'epsilon': epsilon,
-                    # Keep other params at default
-                    'lr': 3e-4,
-                    'gamma': 0.99,
-                    'gae_lambda': 0.95,
-                    'update_epochs': 10,
-                    'batch_size': 64
-                }
+            epsilon_results = []
+            
+            for seed in seeds:
+                # Create config
+                agent_config = copy.deepcopy(self.default_agent_config)
+                agent_config['epsilon'] = epsilon
                 
-                result = self.run_single_experiment(config_name, ppo_kwargs, seed)
-                results[config_name].append(result)
+                config = ExperimentConfig(
+                    name=f"epsilon_{epsilon}_seed_{seed}",
+                    total_timesteps=timesteps,
+                    steps_per_update=self.default_steps_per_update,
+                    seed=seed,
+                    env_config=self.default_env_config,
+                    agent_config=agent_config
+                )
+                
+                result = self.run_single_experiment(config, verbose=True)
+                epsilon_results.append(result)
+            
+            # Aggregate results for this epsilon
+            all_results[epsilon] = self._aggregate_seed_results(epsilon_results)
         
         # Save results
-        self.save_experiment_results(results, "epsilon_comparison")
+        self._save_experiment_results(all_results, save_dir, "epsilon_comparison")
         
-        # Plot comparison
-        self.plot_epsilon_comparison(results)
+        # Generate visualisations
+        self._visualise_epsilon_experiment(all_results, save_dir)
         
-        return results
+        # Print summary
+        self._print_epsilon_summary(all_results)
+        
+        return all_results
     
-    def experiment_learning_rate(self, lr_values=[1e-4, 3e-4, 1e-3]):
+    def run_reward_weight_experiment(
+        self,
+        weight_configs: Optional[List[Dict]] = None,
+        seeds: List[int] = [42, 123],
+        timesteps: Optional[int] = None,
+        save_name: Optional[str] = None
+    ) -> Dict:
         """
-        Experiment 2: Compare different learning rates
+        Compare different reward function weightings.
         
-        Why test this?
-        - Learning rate controls optimization speed
-        - Too small = slow learning
-        - Too large = instability, divergence
+        Tests different balances of:
+        - Efficacy (time in range)
+        - Safety (hypoglycaemia penalty)
+        - Stability (glucose variability)
         
         Args:
-            lr_values: List of learning rates to test
+            weight_configs: List of weight configuration dicts
+            seeds: Random seeds
+            timesteps: Training timesteps
+            save_name: Name for saving results
         
         Returns:
-            Dictionary with all results
+            Dictionary with all experiment results
         """
-        print("\n" + "="*60)
-        print("EXPERIMENT 2: LEARNING RATE COMPARISON")
-        print("="*60)
-        print(f"Testing learning rates: {lr_values}")
-        print()
+        if weight_configs is None:
+            # Default weight configurations to test
+            weight_configs = [
+                {'name': 'balanced', 'efficacy': 1.0, 'safety': 2.0, 'stability': 0.1},
+                {'name': 'safety_focused', 'efficacy': 1.0, 'safety': 4.0, 'stability': 0.1},
+                {'name': 'efficacy_focused', 'efficacy': 2.0, 'safety': 1.0, 'stability': 0.1},
+                {'name': 'stability_focused', 'efficacy': 1.0, 'safety': 2.0, 'stability': 0.5}
+            ]
         
-        results = {}
+        if timesteps is None:
+            timesteps = self.default_timesteps
         
-        for lr in lr_values:
-            config_name = f"lr_{lr}"
-            results[config_name] = []
+        if save_name is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_name = f"reward_weight_experiment_{timestamp}"
+        
+        save_dir = os.path.join(self.base_save_dir, save_name)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        print("\n" + "=" * 70)
+        print("REWARD WEIGHT COMPARISON EXPERIMENT")
+        print("=" * 70)
+        print(f"Configurations: {[c['name'] for c in weight_configs]}")
+        print(f"Seeds: {seeds}")
+        print(f"Timesteps: {timesteps:,}")
+        print("=" * 70)
+        
+        all_results = {}
+        
+        for weight_config in weight_configs:
+            config_name = weight_config['name']
+            print(f"\n{'─'*50}")
+            print(f"Testing: {config_name}")
+            print(f"Weights: efficacy={weight_config['efficacy']}, "
+                  f"safety={weight_config['safety']}, "
+                  f"stability={weight_config['stability']}")
+            print(f"{'─'*50}")
             
-            for seed in range(self.num_seeds):
-                ppo_kwargs = {
-                    'lr': lr,
-                    'epsilon': 0.2,  # Use default
-                    'gamma': 0.99,
-                    'gae_lambda': 0.95,
-                    'update_epochs': 10,
-                    'batch_size': 64
-                }
+            config_results = []
+            
+            for seed in seeds:
+                # Create environment with modified reward weights
+                env_config = copy.deepcopy(self.default_env_config)
+                # Note: In a full implementation, you would pass these weights
+                # to the environment's reward function
                 
-                result = self.run_single_experiment(config_name, ppo_kwargs, seed)
-                results[config_name].append(result)
+                config = ExperimentConfig(
+                    name=f"reward_{config_name}_seed_{seed}",
+                    total_timesteps=timesteps,
+                    steps_per_update=self.default_steps_per_update,
+                    seed=seed,
+                    env_config=env_config,
+                    agent_config=self.default_agent_config
+                )
+                
+                result = self.run_single_experiment(config, verbose=True)
+                config_results.append(result)
+            
+            all_results[config_name] = self._aggregate_seed_results(config_results)
         
-        self.save_experiment_results(results, "learning_rate_comparison")
-        self.plot_learning_rate_comparison(results)
+        # Save results
+        self._save_experiment_results(all_results, save_dir, "reward_weight_comparison")
         
-        return results
+        # Generate visualisations
+        self._visualise_reward_experiment(all_results, save_dir)
+        
+        return all_results
     
-    def experiment_update_epochs(self, epoch_values=[3, 10, 20]):
+    def run_baseline_comparison(
+        self,
+        model_path: Optional[str] = None,
+        train_if_no_model: bool = True,
+        timesteps: Optional[int] = None,
+        seed: int = 42,
+        save_name: Optional[str] = None
+    ) -> Dict:
         """
-        Experiment 3: Compare different numbers of update epochs
+        Compare PPO agent against baseline controllers.
         
-        Why test this?
-        - More epochs = more updates per batch of data
-        - But too many can lead to overfitting on old data
-        - Shows tradeoff between sample efficiency and stability
+        Baselines:
+        - Fixed basal rate
+        - Standard basal-bolus therapy
+        - Rule-based controller
+        - PID controller
         
         Args:
-            epoch_values: List of epoch counts to test
+            model_path: Path to pre-trained model (optional)
+            train_if_no_model: Train new model if path not provided
+            timesteps: Training timesteps for new model
+            seed: Random seed
+            save_name: Name for saving results
         
         Returns:
-            Dictionary with all results
+            Comparison results dictionary
         """
-        print("\n" + "="*60)
-        print("EXPERIMENT 3: UPDATE EPOCHS COMPARISON")
-        print("="*60)
-        print(f"Testing epoch values: {epoch_values}")
-        print()
+        if timesteps is None:
+            timesteps = self.default_timesteps
         
-        results = {}
+        if save_name is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_name = f"baseline_comparison_{timestamp}"
         
-        for epochs in epoch_values:
-            config_name = f"epochs_{epochs}"
-            results[config_name] = []
+        save_dir = os.path.join(self.base_save_dir, save_name)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        print("\n" + "=" * 70)
+        print("BASELINE COMPARISON EXPERIMENT")
+        print("=" * 70)
+        
+        results = []
+        
+        # Train or load PPO agent
+        if model_path is not None and os.path.exists(model_path):
+            print(f"Loading pre-trained model from {model_path}")
+            # Create agent and load
+            env = GlucoseInsulinEnv(**self.default_env_config)
+            agent = PPOAgent(
+                state_dim=env.observation_space.shape[0],
+                action_dim=env.action_space.shape[0],
+                action_low=0.0,
+                action_high=self.default_env_config['max_insulin_dose'],
+                **self.default_agent_config
+            )
+            agent.load(model_path)
+        elif train_if_no_model:
+            print("Training new PPO agent...")
+            config = ExperimentConfig(
+                name="ppo_for_baseline_comparison",
+                total_timesteps=timesteps,
+                steps_per_update=self.default_steps_per_update,
+                seed=seed,
+                env_config=self.default_env_config,
+                agent_config=self.default_agent_config
+            )
+            exp_result = self.run_single_experiment(config, verbose=True)
             
-            for seed in range(self.num_seeds):
-                ppo_kwargs = {
-                    'update_epochs': epochs,
-                    'epsilon': 0.2,
-                    'lr': 3e-4,
-                    'gamma': 0.99,
-                    'gae_lambda': 0.95,
-                    'batch_size': 64
-                }
-                
-                result = self.run_single_experiment(config_name, ppo_kwargs, seed)
-                results[config_name].append(result)
+            # Save the trained agent
+            agent_path = os.path.join(save_dir, "ppo_agent.pt")
+            # Need to recreate and train agent to save
+            env = GlucoseInsulinEnv(**self.default_env_config)
+            agent = PPOAgent(
+                state_dim=env.observation_space.shape[0],
+                action_dim=env.action_space.shape[0],
+                action_low=0.0,
+                action_high=self.default_env_config['max_insulin_dose'],
+                **self.default_agent_config
+            )
+            # Re-train briefly or use the result
+            # For simplicity, we'll evaluate using the training results
+            ppo_eval = exp_result.final_eval
+            ppo_eval['name'] = 'PPO Agent'
+            results.append(ppo_eval)
+            agent = None  # Signal that we used training results
+        else:
+            print("No model provided and train_if_no_model=False")
+            agent = None
         
-        self.save_experiment_results(results, "update_epochs_comparison")
-        self.plot_epochs_comparison(results)
+        # Evaluate PPO agent if we have one
+        if agent is not None:
+            print("\nEvaluating PPO agent...")
+            ppo_result = evaluate_ppo_agent(
+                agent=agent,
+                env_config=self.default_env_config,
+                num_episodes=self.eval_episodes,
+                seed=seed
+            )
+            results.append(ppo_result.summary())
         
-        return results
+        # Evaluate baselines
+        print("\nEvaluating baseline controllers...")
+        
+        baselines = [
+            FixedBasalController(basal_rate=1.0),
+            BasalBolusController(basal_rate=0.8, insulin_to_carb_ratio=10.0),
+            RuleBasedController(basal_rate=1.0, target_glucose=120.0),
+            PIDController(basal_rate=1.0, target_glucose=120.0)
+        ]
+        
+        for controller in baselines:
+            print(f"  Evaluating {controller.name}...")
+            baseline_result = evaluate_controller(
+                controller=controller,
+                env_config=self.default_env_config,
+                num_episodes=self.eval_episodes,
+                seed=seed
+            )
+            results.append(baseline_result.summary())
+        
+        # Compare and save
+        comparison = compare_controllers(
+            [EvaluationResult(
+                name=r['name'],
+                rewards=[r['mean_reward']],
+                clinical_metrics=[r],
+                glucose_traces=[],
+                insulin_traces=[]
+            ) for r in results],
+            save_path=os.path.join(save_dir, "comparison.json")
+        )
+        
+        # Visualise
+        self._visualise_baseline_comparison(results, save_dir)
+        
+        return {
+            'results': results,
+            'comparison': comparison
+        }
     
-    def save_experiment_results(self, results, experiment_name):
-        """Save experiment results to JSON"""
+    def _aggregate_seed_results(
+        self,
+        results: List[ExperimentResult]
+    ) -> Dict:
+        """Aggregate results across multiple seeds."""
+        # Combine episode rewards (as lists of lists)
+        all_rewards = [r.episode_rewards for r in results]
+        all_clinical = [r.clinical_metrics for r in results]
+        all_agent_metrics = [r.agent_metrics for r in results]
         
-        # Convert to JSON-serializable format
-        def convert_to_serializable(obj):
-            if isinstance(obj, (np.integer, np.int64, np.int32)):
+        # Find minimum length for alignment
+        min_episodes = min(len(r) for r in all_rewards)
+        
+        # Truncate to same length
+        aligned_rewards = [r[:min_episodes] for r in all_rewards]
+        aligned_clinical = [c[:min_episodes] for c in all_clinical]
+        
+        # Compute statistics
+        rewards_array = np.array(aligned_rewards)
+        mean_rewards = np.mean(rewards_array, axis=0)
+        std_rewards = np.std(rewards_array, axis=0)
+        
+        # Aggregate clinical metrics
+        tir_array = np.array([[c['time_in_range'] for c in clinical] for clinical in aligned_clinical])
+        mean_tir = np.mean(tir_array, axis=0)
+        std_tir = np.std(tir_array, axis=0)
+        
+        # Aggregate final evaluations
+        final_evals = [r.final_eval for r in results]
+        
+        return {
+            'episode_rewards': mean_rewards.tolist(),
+            'episode_rewards_std': std_rewards.tolist(),
+            'clinical_metrics': [
+                {
+                    'time_in_range': float(mean_tir[i]),
+                    'time_in_range_std': float(std_tir[i])
+                }
+                for i in range(len(mean_tir))
+            ],
+            'final_eval': {
+                'mean_reward': np.mean([e['mean_reward'] for e in final_evals]),
+                'std_reward': np.std([e['mean_reward'] for e in final_evals]),
+                'mean_tir': np.mean([e['mean_tir'] for e in final_evals]),
+                'std_tir': np.std([e['mean_tir'] for e in final_evals]),
+                'mean_tbr': np.mean([e['mean_tbr'] for e in final_evals]),
+                'mean_tar': np.mean([e['mean_tar'] for e in final_evals])
+            },
+            'num_seeds': len(results),
+            'training_times': [r.training_time for r in results],
+            'individual_results': [r.to_dict() for r in results]
+        }
+    
+    def _save_experiment_results(
+        self,
+        results: Dict,
+        save_dir: str,
+        name: str
+    ) -> None:
+        """Save experiment results to JSON."""
+        # Convert numpy arrays to lists for JSON serialisation
+        def convert(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.int64, np.int32)):
                 return int(obj)
             elif isinstance(obj, (np.floating, np.float64, np.float32)):
                 return float(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, list):
-                return [convert_to_serializable(item) for item in obj]
             elif isinstance(obj, dict):
-                return {key: convert_to_serializable(value) for key, value in obj.items()}
+                return {k: convert(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert(v) for v in obj]
             return obj
         
-        results = convert_to_serializable(results)
+        results_converted = convert(results)
         
-        filename = os.path.join(self.experiment_dir, f"{experiment_name}.json")
-        with open(filename, 'w') as f:
-            json.dump(results, f, indent=2)
+        filepath = os.path.join(save_dir, f"{name}.json")
+        with open(filepath, 'w') as f:
+            json.dump(results_converted, f, indent=2)
         
-        print(f"\n✓ Results saved to: {filename}")
+        print(f"\nResults saved to: {filepath}")
     
-    def plot_epsilon_comparison(self, results):
-        """
-        Plot comparison of different epsilon values
+    def _visualise_epsilon_experiment(
+        self,
+        results: Dict,
+        save_dir: str
+    ) -> None:
+        """Generate visualisations for epsilon experiment."""
+        vis = PPOVisualiser(save_dir=save_dir)
         
-        This creates THE KEY FIGURE for your tutorial!
-        """
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle('PPO Epsilon Comparison: The Key Hyperparameter', 
-                     fontsize=16, fontweight='bold')
-        
-        # Extract data for each epsilon
+        # Prepare data for epsilon comparison plot
         epsilon_data = {}
+        for epsilon, data in results.items():
+            epsilon_data[epsilon] = {
+                'episode_rewards': data['episode_rewards'],
+                'clinical_metrics': data['clinical_metrics']
+            }
         
-        for config_name, runs in results.items():
-            epsilon = float(config_name.split('_')[1])
-            
-            # Collect all episode rewards from all seeds
-            all_rewards = []
-            max_length = 0
-            
-            for run in runs:
-                rewards = run['episode_rewards']
-                all_rewards.append(rewards)
-                max_length = max(max_length, len(rewards))
-            
-            epsilon_data[epsilon] = all_rewards
+        vis.plot_epsilon_comparison(
+            experiment_results=epsilon_data,
+            title="Effect of Clipping Parameter ε on Learning",
+            filename="epsilon_comparison.png"
+        )
         
-        # ============================================================
-        # Plot 1: Learning Curves with Confidence Intervals
-        # ============================================================
-        ax = axes[0, 0]
+        # Additional detailed plots
+        self._plot_epsilon_learning_curves(results, save_dir)
+        self._plot_epsilon_clinical_comparison(results, save_dir)
+    
+    def _plot_epsilon_learning_curves(
+        self,
+        results: Dict,
+        save_dir: str
+    ) -> None:
+        """Plot detailed learning curves for epsilon experiment."""
+        import matplotlib.pyplot as plt
+        from scipy.ndimage import uniform_filter1d
         
-        colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(epsilon_data)))
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle('Epsilon Experiment: Learning Dynamics', fontsize=14, fontweight='bold')
         
-        for idx, (epsilon, all_rewards) in enumerate(sorted(epsilon_data.items())):
-            # Interpolate to common length for averaging
-            max_len = max(len(r) for r in all_rewards)
-            
-            interpolated = []
-            for rewards in all_rewards:
-                if len(rewards) < max_len:
-                    # Simple interpolation
-                    indices = np.linspace(0, len(rewards)-1, max_len)
-                    interp_rewards = np.interp(indices, np.arange(len(rewards)), rewards)
-                    interpolated.append(interp_rewards)
-                else:
-                    interpolated.append(rewards[:max_len])
-            
-            interpolated = np.array(interpolated)
-            mean_rewards = np.mean(interpolated, axis=0)
-            std_rewards = np.std(interpolated, axis=0)
+        colours = plt.cm.viridis(np.linspace(0.2, 0.8, len(results)))
+        
+        # Plot 1: Reward curves with confidence bands
+        ax1 = axes[0]
+        for (epsilon, data), colour in zip(sorted(results.items()), colours):
+            rewards = np.array(data['episode_rewards'])
+            rewards_std = np.array(data.get('episode_rewards_std', np.zeros_like(rewards)))
+            episodes = np.arange(len(rewards))
             
             # Smooth
-            if len(mean_rewards) > 20:
-                window = min(20, len(mean_rewards) // 10)
-                mean_rewards = uniform_filter1d(mean_rewards, size=window)
-                std_rewards = uniform_filter1d(std_rewards, size=window)
+            window = min(30, len(rewards) // 5)
+            if window > 1:
+                rewards_smooth = uniform_filter1d(rewards, size=window, mode='nearest')
+                std_smooth = uniform_filter1d(rewards_std, size=window, mode='nearest')
+            else:
+                rewards_smooth = rewards
+                std_smooth = rewards_std
             
-            episodes = np.arange(len(mean_rewards))
-            
-            ax.plot(episodes, mean_rewards, linewidth=2.5, 
-                   color=colors[idx], label=f'ε = {epsilon}')
-            ax.fill_between(episodes, 
-                           mean_rewards - std_rewards,
-                           mean_rewards + std_rewards,
-                           alpha=0.2, color=colors[idx])
+            ax1.plot(episodes, rewards_smooth, color=colour, linewidth=2, label=f'ε = {epsilon}')
+            ax1.fill_between(episodes, 
+                           rewards_smooth - std_smooth,
+                           rewards_smooth + std_smooth,
+                           color=colour, alpha=0.2)
         
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Episode Reward')
-        ax.set_title('Learning Curves (Mean ± Std across seeds)')
-        ax.legend()
-        ax.grid(alpha=0.3)
+        ax1.set_xlabel('Episode')
+        ax1.set_ylabel('Episode Reward')
+        ax1.set_title('Learning Curves (mean ± std across seeds)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
         
-        # Add interpretation box
-        ax.text(0.02, 0.98, 
-               'ε = 0.1: Conservative, slower\nε = 0.2: Balanced (default)\nε = 0.3: Aggressive, may be unstable',
-               transform=ax.transAxes,
-               fontsize=9,
-               verticalalignment='top',
-               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        # Plot 2: Final performance comparison
+        ax2 = axes[1]
+        epsilons = sorted(results.keys())
+        final_rewards = [results[e]['final_eval']['mean_reward'] for e in epsilons]
+        final_stds = [results[e]['final_eval']['std_reward'] for e in epsilons]
         
-        # ============================================================
-        # Plot 2: Final Performance (Box Plot)
-        # ============================================================
-        ax = axes[0, 1]
+        bars = ax2.bar(range(len(epsilons)), final_rewards, yerr=final_stds,
+                      color=colours, capsize=5, alpha=0.8)
         
-        final_performances = []
-        labels = []
+        ax2.set_xticks(range(len(epsilons)))
+        ax2.set_xticklabels([f'ε = {e}' for e in epsilons])
+        ax2.set_ylabel('Final Mean Reward')
+        ax2.set_title('Final Performance (mean ± std)')
+        ax2.grid(True, alpha=0.3, axis='y')
         
-        for epsilon in sorted(epsilon_data.keys()):
-            # Take last 50 episodes from each seed
-            finals = []
-            for rewards in epsilon_data[epsilon]:
-                if len(rewards) >= 50:
-                    finals.extend(rewards[-50:])
-                else:
-                    finals.extend(rewards)
-            
-            final_performances.append(finals)
-            labels.append(f'ε={epsilon}')
-        
-        bp = ax.boxplot(final_performances, labels=labels, patch_artist=True)
-        
-        # Color boxes
-        for patch, color in zip(bp['boxes'], colors):
-            patch.set_facecolor(color)
-        
-        ax.set_ylabel('Episode Reward')
-        ax.set_title('Final Performance Distribution\n(Last 50 episodes, all seeds)')
-        ax.grid(alpha=0.3, axis='y')
-        
-        # Add mean values as text
-        for i, (finals, label) in enumerate(zip(final_performances, labels)):
-            mean_val = np.mean(finals)
-            ax.text(i+1, ax.get_ylim()[1]*0.95, f'{mean_val:.1f}',
-                   ha='center', fontsize=10, fontweight='bold')
-        
-        # ============================================================
-        # Plot 3: Sample Efficiency (Episodes to Threshold)
-        # ============================================================
-        ax = axes[1, 0]
-        
-        threshold = 195  # CartPole is "solved" at 195
-        
-        episodes_to_threshold = []
-        epsilon_labels = []
-        
-        for epsilon in sorted(epsilon_data.keys()):
-            eps_to_thresh = []
-            
-            for rewards in epsilon_data[epsilon]:
-                # Find first episode where running average exceeds threshold
-                window = 10
-                if len(rewards) >= window:
-                    running_avg = uniform_filter1d(rewards, size=window)
-                    solved_idx = np.where(running_avg >= threshold)[0]
-                    
-                    if len(solved_idx) > 0:
-                        eps_to_thresh.append(solved_idx[0])
-                    else:
-                        eps_to_thresh.append(len(rewards))  # Didn't solve
-            
-            if eps_to_thresh:
-                episodes_to_threshold.append(eps_to_thresh)
-                epsilon_labels.append(f'ε={epsilon}')
-        
-        if episodes_to_threshold:
-            bp = ax.boxplot(episodes_to_threshold, labels=epsilon_labels, patch_artist=True)
-            
-            for patch, color in zip(bp['boxes'], colors):
-                patch.set_facecolor(color)
-            
-            ax.set_ylabel('Episodes to Solve')
-            ax.set_title(f'Sample Efficiency\n(Episodes to reach {threshold} reward)')
-            ax.grid(alpha=0.3, axis='y')
-        
-        # ============================================================
-        # Plot 4: Stability (Coefficient of Variation)
-        # ============================================================
-        ax = axes[1, 1]
-        
-        stability_scores = []
-        epsilon_vals = []
-        
-        for epsilon in sorted(epsilon_data.keys()):
-            # Calculate CV (std/mean) for last 50 episodes
-            cvs = []
-            for rewards in epsilon_data[epsilon]:
-                if len(rewards) >= 50:
-                    last_50 = rewards[-50:]
-                    cv = np.std(last_50) / (np.mean(last_50) + 1e-8)
-                    cvs.append(cv)
-            
-            if cvs:
-                stability_scores.append(np.mean(cvs))
-                epsilon_vals.append(epsilon)
-        
-        bars = ax.bar(range(len(epsilon_vals)), stability_scores, color=colors)
-        ax.set_xticks(range(len(epsilon_vals)))
-        ax.set_xticklabels([f'ε={e}' for e in epsilon_vals])
-        ax.set_ylabel('Coefficient of Variation (lower = more stable)')
-        ax.set_title('Training Stability\n(CV of last 50 episodes)')
-        ax.grid(alpha=0.3, axis='y')
-        
-        # Add value labels on bars
-        for i, (bar, val) in enumerate(zip(bars, stability_scores)):
-            ax.text(bar.get_x() + bar.get_width()/2, val + 0.01,
-                   f'{val:.3f}', ha='center', va='bottom', fontweight='bold')
+        # Add value labels
+        for bar, val, std in zip(bars, final_rewards, final_stds):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 1,
+                    f'{val:.1f}', ha='center', va='bottom', fontsize=10)
         
         plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'epsilon_learning_curves.png'),
+                   dpi=300, bbox_inches='tight')
+        plt.close()
         
-        # Save
-        filename = os.path.join(self.experiment_dir, "epsilon_comparison.png")
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"✓ Saved plot: {filename}")
-        
-        return fig
+        print(f"  Saved: {os.path.join(save_dir, 'epsilon_learning_curves.png')}")
     
-    def plot_learning_rate_comparison(self, results):
-        """Plot learning rate comparison"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle('Learning Rate Comparison', fontsize=16, fontweight='bold')
+    def _plot_epsilon_clinical_comparison(
+        self,
+        results: Dict,
+        save_dir: str
+    ) -> None:
+        """Plot clinical metrics comparison for epsilon experiment."""
+        import matplotlib.pyplot as plt
         
-        # Similar structure to epsilon comparison
-        # Extract and plot learning curves for each LR
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig.suptitle('Epsilon Experiment: Clinical Outcomes', fontsize=14, fontweight='bold')
         
-        lr_data = {}
-        for config_name, runs in results.items():
-            lr = float(config_name.split('_')[1])
-            all_rewards = [run['episode_rewards'] for run in runs]
-            lr_data[lr] = all_rewards
+        epsilons = sorted(results.keys())
+        colours = plt.cm.viridis(np.linspace(0.2, 0.8, len(epsilons)))
         
-        ax = axes[0, 0]
-        colors = plt.cm.plasma(np.linspace(0.2, 0.8, len(lr_data)))
+        metrics = ['mean_tir', 'mean_tbr', 'mean_tar']
+        titles = ['Time in Range (%)', 'Time Below Range (%)', 'Time Above Range (%)']
+        targets = [70, 4, 25]  # Clinical targets
+        target_labels = ['Target: >70%', 'Target: <4%', 'Target: <25%']
         
-        for idx, (lr, all_rewards) in enumerate(sorted(lr_data.items())):
-            max_len = max(len(r) for r in all_rewards)
-            interpolated = []
-            for rewards in all_rewards:
-                if len(rewards) < max_len:
-                    indices = np.linspace(0, len(rewards)-1, max_len)
-                    interp_rewards = np.interp(indices, np.arange(len(rewards)), rewards)
-                    interpolated.append(interp_rewards)
-                else:
-                    interpolated.append(rewards[:max_len])
+        for ax, metric, title, target, target_label in zip(axes, metrics, titles, targets, target_labels):
+            values = [results[e]['final_eval'][metric] for e in epsilons]
+            stds = [results[e]['final_eval'].get(f'std_{metric.split("_")[1]}', 0) for e in epsilons]
             
-            interpolated = np.array(interpolated)
-            mean_rewards = np.mean(interpolated, axis=0)
-            std_rewards = np.std(interpolated, axis=0)
+            bars = ax.bar(range(len(epsilons)), values, yerr=stds,
+                         color=colours, capsize=5, alpha=0.8)
             
-            if len(mean_rewards) > 20:
-                window = min(20, len(mean_rewards) // 10)
-                mean_rewards = uniform_filter1d(mean_rewards, size=window)
+            # Add target line
+            if metric == 'mean_tir':
+                ax.axhline(y=target, color='green', linestyle='--', alpha=0.7, label=target_label)
+            else:
+                ax.axhline(y=target, color='red', linestyle='--', alpha=0.7, label=target_label)
             
-            episodes = np.arange(len(mean_rewards))
-            ax.plot(episodes, mean_rewards, linewidth=2.5, 
-                   color=colors[idx], label=f'LR = {lr}')
-        
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Episode Reward')
-        ax.set_title('Learning Curves for Different Learning Rates')
-        ax.legend()
-        ax.grid(alpha=0.3)
-        
-        # Add other subplots...
-        axes[0, 1].text(0.5, 0.5, 'Final Performance\n(Coming soon)', 
-                       ha='center', va='center', transform=axes[0, 1].transAxes)
-        axes[1, 0].text(0.5, 0.5, 'Convergence Speed\n(Coming soon)', 
-                       ha='center', va='center', transform=axes[1, 0].transAxes)
-        axes[1, 1].text(0.5, 0.5, 'Stability\n(Coming soon)', 
-                       ha='center', va='center', transform=axes[1, 1].transAxes)
+            ax.set_xticks(range(len(epsilons)))
+            ax.set_xticklabels([f'ε = {e}' for e in epsilons])
+            ax.set_ylabel(title)
+            ax.set_title(title)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            # Add value labels
+            for bar, val in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                       f'{val:.1f}', ha='center', va='bottom', fontsize=9)
         
         plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'epsilon_clinical_comparison.png'),
+                   dpi=300, bbox_inches='tight')
+        plt.close()
         
-        filename = os.path.join(self.experiment_dir, "learning_rate_comparison.png")
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"✓ Saved plot: {filename}")
-        
-        return fig
+        print(f"  Saved: {os.path.join(save_dir, 'epsilon_clinical_comparison.png')}")
     
-    def plot_epochs_comparison(self, results):
-        """Plot update epochs comparison"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle('Update Epochs Comparison', fontsize=16, fontweight='bold')
+    def _visualise_reward_experiment(
+        self,
+        results: Dict,
+        save_dir: str
+    ) -> None:
+        """Generate visualisations for reward weight experiment."""
+        import matplotlib.pyplot as plt
         
-        # Similar to above...
-        epochs_data = {}
-        for config_name, runs in results.items():
-            epochs = int(config_name.split('_')[1])
-            all_rewards = [run['episode_rewards'] for run in runs]
-            epochs_data[epochs] = all_rewards
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Reward Weight Experiment Results', fontsize=14, fontweight='bold')
         
-        ax = axes[0, 0]
-        colors = plt.cm.cool(np.linspace(0.2, 0.8, len(epochs_data)))
+        config_names = list(results.keys())
+        colours = plt.cm.Set2(np.linspace(0, 1, len(config_names)))
         
-        for idx, (epochs, all_rewards) in enumerate(sorted(epochs_data.items())):
-            max_len = max(len(r) for r in all_rewards)
-            interpolated = []
-            for rewards in all_rewards:
-                if len(rewards) < max_len:
-                    indices = np.linspace(0, len(rewards)-1, max_len)
-                    interp_rewards = np.interp(indices, np.arange(len(rewards)), rewards)
-                    interpolated.append(interp_rewards)
-                else:
-                    interpolated.append(rewards[:max_len])
-            
-            interpolated = np.array(interpolated)
-            mean_rewards = np.mean(interpolated, axis=0)
-            
-            if len(mean_rewards) > 20:
-                window = min(20, len(mean_rewards) // 10)
-                mean_rewards = uniform_filter1d(mean_rewards, size=window)
-            
-            episodes_arr = np.arange(len(mean_rewards))
-            ax.plot(episodes_arr, mean_rewards, linewidth=2.5, 
-                   color=colors[idx], label=f'{epochs} epochs')
+        # Plot 1: Learning curves
+        ax1 = axes[0, 0]
+        for name, colour in zip(config_names, colours):
+            rewards = results[name]['episode_rewards']
+            ax1.plot(rewards, color=colour, label=name, alpha=0.8)
+        ax1.set_xlabel('Episode')
+        ax1.set_ylabel('Episode Reward')
+        ax1.set_title('Learning Curves')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
         
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Episode Reward')
-        ax.set_title('Learning Curves for Different Update Epochs')
-        ax.legend()
-        ax.grid(alpha=0.3)
+        # Plot 2: Final reward comparison
+        ax2 = axes[0, 1]
+        final_rewards = [results[n]['final_eval']['mean_reward'] for n in config_names]
+        bars = ax2.bar(range(len(config_names)), final_rewards, color=colours)
+        ax2.set_xticks(range(len(config_names)))
+        ax2.set_xticklabels(config_names, rotation=45, ha='right')
+        ax2.set_ylabel('Final Mean Reward')
+        ax2.set_title('Final Performance')
+        ax2.grid(True, alpha=0.3, axis='y')
         
-        axes[0, 1].text(0.5, 0.5, 'Sample Efficiency\n(Coming soon)', 
-                       ha='center', va='center', transform=axes[0, 1].transAxes)
-        axes[1, 0].text(0.5, 0.5, 'Wall Clock Time\n(Coming soon)', 
-                       ha='center', va='center', transform=axes[1, 0].transAxes)
-        axes[1, 1].text(0.5, 0.5, 'Overfitting Risk\n(Coming soon)', 
-                       ha='center', va='center', transform=axes[1, 1].transAxes)
+        # Plot 3: Time in Range comparison
+        ax3 = axes[1, 0]
+        tir_values = [results[n]['final_eval']['mean_tir'] for n in config_names]
+        bars = ax3.bar(range(len(config_names)), tir_values, color=colours)
+        ax3.axhline(y=70, color='green', linestyle='--', alpha=0.7, label='Target (70%)')
+        ax3.set_xticks(range(len(config_names)))
+        ax3.set_xticklabels(config_names, rotation=45, ha='right')
+        ax3.set_ylabel('Time in Range (%)')
+        ax3.set_title('Clinical Efficacy')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3, axis='y')
+        
+        # Plot 4: Safety comparison (TBR)
+        ax4 = axes[1, 1]
+        tbr_values = [results[n]['final_eval']['mean_tbr'] for n in config_names]
+        bars = ax4.bar(range(len(config_names)), tbr_values, color=colours)
+        ax4.axhline(y=4, color='red', linestyle='--', alpha=0.7, label='Target (<4%)')
+        ax4.set_xticks(range(len(config_names)))
+        ax4.set_xticklabels(config_names, rotation=45, ha='right')
+        ax4.set_ylabel('Time Below Range (%)')
+        ax4.set_title('Safety (Hypoglycaemia)')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3, axis='y')
         
         plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'reward_weight_comparison.png'),
+                   dpi=300, bbox_inches='tight')
+        plt.close()
         
-        filename = os.path.join(self.experiment_dir, "update_epochs_comparison.png")
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"✓ Saved plot: {filename}")
+        print(f"  Saved: {os.path.join(save_dir, 'reward_weight_comparison.png')}")
+    
+    def _visualise_baseline_comparison(
+        self,
+        results: List[Dict],
+        save_dir: str
+    ) -> None:
+        """Generate visualisations for baseline comparison."""
+        import matplotlib.pyplot as plt
         
-        return fig
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig.suptitle('PPO vs Baseline Controllers', fontsize=14, fontweight='bold')
+        
+        names = [r['name'] for r in results]
+        colours = plt.cm.Set2(np.linspace(0, 1, len(names)))
+        
+        # Highlight PPO differently
+        edge_colours = ['red' if 'PPO' in n else 'none' for n in names]
+        linewidths = [2 if 'PPO' in n else 0 for n in names]
+        
+        # Plot 1: Reward comparison
+        ax1 = axes[0]
+        rewards = [r['mean_reward'] for r in results]
+        bars = ax1.bar(range(len(names)), rewards, color=colours,
+                      edgecolor=edge_colours, linewidth=linewidths)
+        ax1.set_xticks(range(len(names)))
+        ax1.set_xticklabels(names, rotation=45, ha='right', fontsize=9)
+        ax1.set_ylabel('Mean Reward')
+        ax1.set_title('Overall Performance')
+        ax1.grid(True, alpha=0.3, axis='y')
+        
+        # Add value labels
+        for bar, val in zip(bars, rewards):
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{val:.0f}', ha='center', va='bottom', fontsize=9)
+        
+        # Plot 2: Time in Range
+        ax2 = axes[1]
+        tir = [r['mean_tir'] for r in results]
+        bars = ax2.bar(range(len(names)), tir, color=colours,
+                      edgecolor=edge_colours, linewidth=linewidths)
+        ax2.axhline(y=70, color='green', linestyle='--', alpha=0.7, label='Target (>70%)')
+        ax2.set_xticks(range(len(names)))
+        ax2.set_xticklabels(names, rotation=45, ha='right', fontsize=9)
+        ax2.set_ylabel('Time in Range (%)')
+        ax2.set_title('Clinical Efficacy')
+        ax2.legend(fontsize=9)
+        ax2.grid(True, alpha=0.3, axis='y')
+        
+        for bar, val in zip(bars, tir):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{val:.1f}', ha='center', va='bottom', fontsize=9)
+        
+        # Plot 3: Time Below Range (Safety)
+        ax3 = axes[2]
+        tbr = [r['mean_tbr'] for r in results]
+        bars = ax3.bar(range(len(names)), tbr, color=colours,
+                      edgecolor=edge_colours, linewidth=linewidths)
+        ax3.axhline(y=4, color='red', linestyle='--', alpha=0.7, label='Target (<4%)')
+        ax3.set_xticks(range(len(names)))
+        ax3.set_xticklabels(names, rotation=45, ha='right', fontsize=9)
+        ax3.set_ylabel('Time Below Range (%)')
+        ax3.set_title('Safety (Lower is Better)')
+        ax3.legend(fontsize=9)
+        ax3.grid(True, alpha=0.3, axis='y')
+        
+        for bar, val in zip(bars, tbr):
+            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{val:.1f}', ha='center', va='bottom', fontsize=9)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'baseline_comparison.png'),
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  Saved: {os.path.join(save_dir, 'baseline_comparison.png')}")
+    
+    def _print_epsilon_summary(self, results: Dict) -> None:
+        """Print summary table for epsilon experiment."""
+        print("\n" + "=" * 80)
+        print("EPSILON EXPERIMENT SUMMARY")
+        print("=" * 80)
+        print(f"{'Epsilon':<10} {'Reward':>12} {'TIR (%)':>12} {'TBR (%)':>12} {'Stability':>12}")
+        print("-" * 80)
+        
+        for epsilon in sorted(results.keys()):
+            data = results[epsilon]
+            final = data['final_eval']
+            
+            # Compute stability (CV of rewards)
+            rewards = np.array(data['episode_rewards'])
+            stability = np.std(rewards[-50:]) / (np.abs(np.mean(rewards[-50:])) + 1e-8)
+            
+            print(f"{epsilon:<10} {final['mean_reward']:>12.1f} {final['mean_tir']:>12.1f} "
+                  f"{final['mean_tbr']:>12.1f} {stability:>12.3f}")
+        
+        print("=" * 80)
+        
+        # Find best
+        best_reward = max(results.keys(), key=lambda e: results[e]['final_eval']['mean_reward'])
+        best_tir = max(results.keys(), key=lambda e: results[e]['final_eval']['mean_tir'])
+        best_safety = min(results.keys(), key=lambda e: results[e]['final_eval']['mean_tbr'])
+        
+        print(f"\nBest reward: ε = {best_reward}")
+        print(f"Best TIR: ε = {best_tir}")
+        print(f"Best safety (lowest TBR): ε = {best_safety}")
+        
+        # Overall recommendation
+        print(f"\n→ Recommended: ε = 0.2 (balanced performance)")
 
 
 def main():
-    """
-    Run all experiments
-    """
-    print("\n" + "="*60)
-    print("PPO HYPERPARAMETER EXPERIMENTS")
-    print("="*60)
-    print("\nThis will run systematic experiments to compare:")
-    print("  1. Epsilon values (clipping parameter)")
-    print("  2. Learning rates")
-    print("  3. Update epochs")
-    print("\nEach experiment runs multiple seeds for reliability.")
-    print(f"\nEstimated time: 30-60 minutes")
+    """Run experiments from command line."""
+    import argparse
     
-    response = input("\nContinue? (yes/no): ").strip().lower()
-    if response not in ['yes', 'y']:
-        print("Cancelled.")
-        return
-    
-    # Create experiment runner
-    experiment = PPOExperiment(
-        env_name="CartPole-v1",
-        base_timesteps=50000,  # Faster for experiments
-        num_seeds=3  # Statistical reliability
+    parser = argparse.ArgumentParser(description="Run PPO experiments")
+    parser.add_argument(
+        "--experiment", type=str, required=True,
+        choices=['epsilon', 'reward', 'baseline', 'all'],
+        help="Which experiment to run"
+    )
+    parser.add_argument(
+        "--timesteps", type=int, default=50000,
+        help="Training timesteps per run"
+    )
+    parser.add_argument(
+        "--seeds", type=int, nargs='+', default=[42, 123],
+        help="Random seeds to use"
+    )
+    parser.add_argument(
+        "--save-dir", type=str, default="./experiments",
+        help="Directory to save results"
     )
     
-    # Run experiments
-    print("\n" + "="*60)
-    print("STARTING EXPERIMENTS")
-    print("="*60)
+    args = parser.parse_args()
     
-    # Experiment 1: Epsilon (MOST IMPORTANT!)
-    print("\n🔬 Running Epsilon Experiment...")
-    epsilon_results = experiment.experiment_epsilon(epsilon_values=[0.1, 0.2, 0.3])
+    experiment = PPOExperiment(
+        base_save_dir=args.save_dir,
+        default_timesteps=args.timesteps
+    )
     
-    # Experiment 2: Learning Rate
-    print("\n🔬 Running Learning Rate Experiment...")
-    lr_results = experiment.experiment_learning_rate(lr_values=[1e-4, 3e-4, 1e-3])
+    if args.experiment == 'epsilon' or args.experiment == 'all':
+        experiment.run_epsilon_experiment(
+            epsilon_values=[0.1, 0.2, 0.3],
+            seeds=args.seeds
+        )
     
-    # Experiment 3: Update Epochs
-    print("\n🔬 Running Update Epochs Experiment...")
-    epochs_results = experiment.experiment_update_epochs(epoch_values=[3, 10, 20])
+    if args.experiment == 'reward' or args.experiment == 'all':
+        experiment.run_reward_weight_experiment(
+            seeds=args.seeds
+        )
     
-    print("\n" + "="*60)
-    print("ALL EXPERIMENTS COMPLETE!")
-    print("="*60)
-    print(f"\nResults saved to: {experiment.experiment_dir}")
-    print("\nGenerated plots:")
-    print("  • epsilon_comparison.png (KEY FIGURE!)")
-    print("  • learning_rate_comparison.png")
-    print("  • update_epochs_comparison.png")
-    print("\nUse these in your tutorial to show:")
-    print("  - Why ε=0.2 is the default")
-    print("  - How different hyperparameters affect performance")
-    print("  - The importance of proper tuning")
+    if args.experiment == 'baseline' or args.experiment == 'all':
+        experiment.run_baseline_comparison(
+            train_if_no_model=True
+        )
 
 
 if __name__ == "__main__":

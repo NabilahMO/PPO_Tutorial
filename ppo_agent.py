@@ -1,91 +1,194 @@
 """
-Proximal Policy Optimization (PPO) Agent
-=========================================
+Proximal Policy Optimisation (PPO) Agent for Continuous Actions
+================================================================
 
-This is the HEART of your tutorial. Every line is crucial.
+Implementation of PPO with clipped surrogate objective for
+continuous action spaces (Gaussian policy).
 
-Key Innovation: The Clipped Surrogate Objective
-- Prevents destructively large policy updates
-- Simple to implement (just a clipping operation!)
-- Achieves TRPO's stability without complex math
+Key components:
+- Clipped surrogate objective (Equation 7 from PPO paper)
+- Generalised Advantage Estimation (GAE)
+- Value function clipping (optional)
+- Entropy bonus for exploration
 
-The algorithm:
-1. Collect data using current policy
-2. Compute advantages (how good were the actions?)
-3. Update policy multiple times using the SAME data (key difference from vanilla PG!)
-4. Use clipping to keep updates safe
+Based on:
+- Schulman et al. (2017) "Proximal Policy Optimization Algorithms"
+- Implementation best practices from Stable-Baselines3 and CleanRL
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from collections import deque
+from typing import Dict, List, Tuple, Optional
+
+from networks import ContinuousActorCritic
+
+
+class RolloutBuffer:
+    """
+    Buffer for storing trajectory data during rollout.
+    
+    Stores transitions (s, a, r, s', done) along with
+    log probabilities and value estimates needed for PPO.
+    """
+    
+    def __init__(self):
+        """Initialise empty buffer."""
+        self.states: List[np.ndarray] = []
+        self.actions: List[np.ndarray] = []
+        self.rewards: List[float] = []
+        self.values: List[float] = []
+        self.log_probs: List[float] = []
+        self.dones: List[bool] = []
+    
+    def store(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        value: float,
+        log_prob: float,
+        done: bool
+    ) -> None:
+        """
+        Store a single transition.
+        
+        Args:
+            state: Current state
+            action: Action taken
+            reward: Reward received
+            value: Value estimate V(s)
+            log_prob: Log probability of action under policy
+            done: Whether episode ended
+        """
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.log_probs.append(log_prob)
+        self.dones.append(done)
+    
+    def clear(self) -> None:
+        """Clear all stored data."""
+        self.states.clear()
+        self.actions.clear()
+        self.rewards.clear()
+        self.values.clear()
+        self.log_probs.clear()
+        self.dones.clear()
+    
+    def __len__(self) -> int:
+        """Return number of stored transitions."""
+        return len(self.states)
 
 
 class PPOAgent:
     """
-    Proximal Policy Optimization Agent
+    Proximal Policy Optimisation agent for continuous control.
     
-    This class implements the complete PPO algorithm including:
-    - Clipped surrogate objective (the star of the show!)
-    - Generalized Advantage Estimation (GAE)
-    - Value function learning
-    - Entropy bonus for exploration
+    PPO maintains a policy (actor) and value function (critic),
+    updating them using the clipped surrogate objective to ensure
+    stable learning without destructively large policy changes.
+    
+    Key hyperparameters:
+    - epsilon: Clipping parameter (default 0.2)
+    - gamma: Discount factor (default 0.99)
+    - gae_lambda: GAE parameter (default 0.95)
+    - update_epochs: Number of optimisation epochs per update (default 10)
+    
+    Attributes:
+        network: Actor-Critic neural network
+        optimiser: Adam optimiser
+        buffer: Rollout buffer for storing trajectories
     """
     
     def __init__(
         self,
-        network,
-        lr=3e-4,
-        gamma=0.99,
-        gae_lambda=0.95,
-        epsilon=0.2,
-        value_coef=0.5,
-        entropy_coef=0.01,
-        max_grad_norm=0.5,
-        update_epochs=10,
-        batch_size=64
+        state_dim: int,
+        action_dim: int,
+        action_low: float = 0.0,
+        action_high: float = 5.0,
+        hidden_dim: int = 64,
+        lr: float = 3e-4,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        epsilon: float = 0.2,
+        epsilon_decay: float = 1.0,
+        epsilon_min: float = 0.1,
+        value_coef: float = 0.5,
+        entropy_coef: float = 0.01,
+        max_grad_norm: float = 0.5,
+        update_epochs: int = 10,
+        batch_size: int = 64,
+        clip_value_loss: bool = True,
+        normalise_advantages: bool = True,
+        device: str = 'cpu'
     ):
         """
-        Args:
-            network: ActorCritic neural network
-            lr: Learning rate
-            gamma: Discount factor (how much we care about future rewards)
-            gae_lambda: GAE parameter (bias-variance tradeoff)
-            epsilon: PPO clipping parameter (typically 0.1-0.3)
-            value_coef: Weight for value loss in total loss
-            entropy_coef: Weight for entropy bonus (encourages exploration)
-            max_grad_norm: Gradient clipping threshold
-            update_epochs: How many times to update on each batch of data
-            batch_size: Minibatch size for updates
-        """
-        self.network = network
-        self.optimizer = optim.Adam(network.parameters(), lr=lr)
+        Initialise PPO agent.
         
-        # PPO hyperparameters
+        Args:
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_low: Minimum action value
+            action_high: Maximum action value
+            hidden_dim: Size of network hidden layers
+            lr: Learning rate for Adam optimiser
+            gamma: Discount factor for future rewards
+            gae_lambda: Lambda for Generalised Advantage Estimation
+            epsilon: PPO clipping parameter
+            epsilon_decay: Decay factor for epsilon (per update)
+            epsilon_min: Minimum epsilon value
+            value_coef: Coefficient for value function loss
+            entropy_coef: Coefficient for entropy bonus
+            max_grad_norm: Maximum gradient norm for clipping
+            update_epochs: Number of optimisation epochs per update
+            batch_size: Mini-batch size for updates
+            clip_value_loss: Whether to clip value function loss
+            normalise_advantages: Whether to normalise advantages
+            device: Device to run on ('cpu' or 'cuda')
+        """
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.action_low = action_low
+        self.action_high = action_high
+        
+        # Hyperparameters
         self.gamma = gamma
         self.gae_lambda = gae_lambda
-        self.epsilon = epsilon  # THE KEY PARAMETER!
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.update_epochs = update_epochs
         self.batch_size = batch_size
+        self.clip_value_loss = clip_value_loss
+        self.normalise_advantages = normalise_advantages
+        self.device = device
         
-        # Storage for collected experience
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.values = []
-        self.log_probs = []
-        self.dones = []
+        # Create network
+        self.network = ContinuousActorCritic(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            shared_layers=False  # Separate networks often work better
+        ).to(device)
         
-        # Metrics for visualization
+        # Optimiser
+        self.optimiser = optim.Adam(self.network.parameters(), lr=lr)
+        
+        # Rollout buffer
+        self.buffer = RolloutBuffer()
+        
+        # Metrics tracking
         self.metrics = {
             'policy_loss': [],
             'value_loss': [],
             'entropy': [],
+            'total_loss': [],
             'ratio_mean': [],
             'ratio_std': [],
             'clipped_fraction': [],
@@ -95,203 +198,215 @@ class PPOAgent:
             'advantages_std': []
         }
     
-    def store_transition(self, state, action, reward, value, log_prob, done):
+    def get_action(
+        self,
+        state: np.ndarray,
+        deterministic: bool = False
+    ) -> Tuple[np.ndarray, float, float]:
         """
-        Store a single transition (s, a, r, v, log_p, done)
-        
-        This is called after each environment step during data collection
-        """
-        self.states.append(state)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.values.append(value)
-        self.log_probs.append(log_prob)
-        self.dones.append(done)
-    
-    def compute_gae(self, next_value):
-        """
-        Compute Generalized Advantage Estimation (GAE)
-        
-        GAE is a way to estimate advantages that balances:
-        - Low bias (accurate estimates)
-        - Low variance (stable learning)
-        
-        Formula: A_t = δ_t + (γλ)δ_{t+1} + (γλ)²δ_{t+2} + ...
-        where δ_t = r_t + γV(s_{t+1}) - V(s_t) is the TD error
-        
-        Why GAE?
-        - λ=0: Low variance, high bias (only 1-step TD error)
-        - λ=1: High variance, low bias (Monte Carlo return)
-        - λ=0.95: Sweet spot (typically)
+        Select action using current policy.
         
         Args:
-            next_value: Value estimate for the state after the last stored state
+            state: Current state
+            deterministic: If True, return mean action (for evaluation)
         
         Returns:
-            advantages: numpy array of advantage estimates
-            returns: numpy array of return targets for value function
+            action: Selected action (clipped to valid range)
+            log_prob: Log probability of action
+            value: State value estimate
         """
-        # Convert lists to numpy arrays
-        rewards = np.array(self.rewards)
-        values = np.array(self.values)
-        dones = np.array(self.dones)
+        action, log_prob, value = self.network.get_action(state, deterministic)
         
-        # Initialize
-        advantages = np.zeros_like(rewards)
-        last_gae = 0
+        # Clip action to valid range
+        action = np.clip(action, self.action_low, self.action_high)
         
-        # Compute GAE backwards through time
-        # We go backwards because each advantage depends on future advantages
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                # Last timestep: use next_value as the bootstrap value
-                next_value_t = next_value
-                next_non_terminal = 1.0 - dones[t]
+        return action, log_prob, value
+    
+    def store_transition(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        value: float,
+        log_prob: float,
+        done: bool
+    ) -> None:
+        """Store a transition in the buffer."""
+        self.buffer.store(state, action, reward, value, log_prob, done)
+    
+    def compute_gae(
+        self,
+        next_value: float,
+        next_done: bool
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute Generalised Advantage Estimation (GAE).
+        
+        GAE balances bias and variance in advantage estimation:
+        - lambda=0: High bias, low variance (1-step TD)
+        - lambda=1: Low bias, high variance (Monte Carlo)
+        - lambda=0.95: Good balance (typical default)
+        
+        Formula:
+        A_t = delta_t + (gamma * lambda) * delta_{t+1} + ...
+        where delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)
+        
+        Args:
+            next_value: Value estimate of final state
+            next_done: Whether final state is terminal
+        
+        Returns:
+            advantages: GAE advantages for each timestep
+            returns: Computed returns (advantages + values)
+        """
+        rewards = np.array(self.buffer.rewards)
+        values = np.array(self.buffer.values)
+        dones = np.array(self.buffer.dones)
+        
+        num_steps = len(rewards)
+        advantages = np.zeros(num_steps)
+        
+        # Compute GAE backwards
+        last_gae = 0.0
+        
+        for t in reversed(range(num_steps)):
+            if t == num_steps - 1:
+                next_non_terminal = 1.0 - float(next_done)
+                next_val = next_value
             else:
-                # Other timesteps: use stored value
-                next_value_t = values[t + 1]
-                next_non_terminal = 1.0 - dones[t]
+                next_non_terminal = 1.0 - float(dones[t])
+                next_val = values[t + 1]
             
-            # TD error: δ_t = r_t + γV(s_{t+1}) - V(s_t)
-            # This measures how much better/worse the actual reward was vs expectation
-            delta = rewards[t] + self.gamma * next_value_t * next_non_terminal - values[t]
+            # TD error: delta = r + gamma * V(s') - V(s)
+            delta = rewards[t] + self.gamma * next_val * next_non_terminal - values[t]
             
-            # GAE: A_t = δ_t + (γλ)δ_{t+1} + (γλ)²δ_{t+2} + ...
-            # We compute this recursively: A_t = δ_t + (γλ)A_{t+1}
+            # GAE: A = delta + gamma * lambda * A'
             advantages[t] = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
             last_gae = advantages[t]
         
-        # Returns are advantages + values
-        # These are the targets for the value function
-        # R_t = A_t + V(s_t) ≈ actual return from state s_t
+        # Returns = advantages + values
         returns = advantages + values
         
         return advantages, returns
     
-    def compute_ppo_loss(self, states, actions, old_log_probs, advantages, returns):
+    def compute_ppo_loss(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+        old_values: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        THE HEART OF PPO: Compute the clipped surrogate objective
+        Compute the PPO clipped surrogate loss.
         
-        This is the key innovation that makes PPO work!
+        This is the core of PPO - the clipped objective ensures
+        policy updates stay within a "trust region" without
+        requiring complex constrained optimisation.
         
-        The formula (Equation 7 from paper):
-        L^CLIP(θ) = E[min(r_t(θ)A_t, clip(r_t(θ), 1-ε, 1+ε)A_t)]
-        
-        Where:
-        - r_t(θ) = π_θ(a|s) / π_θ_old(a|s) is the probability ratio
-        - A_t is the advantage
-        - clip() constrains the ratio to [1-ε, 1+ε]
-        - min() takes the pessimistic bound
+        Loss = L_policy + c1 * L_value - c2 * entropy_bonus
         
         Args:
             states: Batch of states
             actions: Batch of actions taken
-            old_log_probs: Log probs from old policy (when data was collected)
-            advantages: Advantage estimates
-            returns: Return targets for value function
+            old_log_probs: Log probs under old policy
+            advantages: Computed advantages
+            returns: Computed returns
+            old_values: Value estimates under old policy
         
         Returns:
-            total_loss: Combined loss for optimization
-            metrics: Dictionary of metrics for logging/visualization
+            total_loss: Combined loss for optimisation
+            metrics: Dictionary of loss components and statistics
         """
-        # Evaluate actions with current policy
-        # This gives us the NEW policy's perspective on the old actions
-        new_log_probs, values, entropy = self.network.evaluate_actions(states, actions)
+        # Get current policy evaluation
+        new_log_probs, new_values, entropy = self.network.evaluate_actions(states, actions)
         
         # ============================================================
-        # STEP 1: Compute the probability ratio
+        # STEP 1: Compute probability ratio
+        # r(theta) = pi_new(a|s) / pi_old(a|s)
+        # In log space: r = exp(log_pi_new - log_pi_old)
         # ============================================================
-        # r(θ) = π_θ(a|s) / π_θ_old(a|s)
-        # 
-        # We work in log space for numerical stability:
-        # r = exp(log π_θ(a|s) - log π_θ_old(a|s))
-        #
-        # What does this ratio mean?
-        # - ratio = 1.0: policy hasn't changed
-        # - ratio > 1.0: new policy is MORE likely to take this action
-        # - ratio < 1.0: new policy is LESS likely to take this action
         ratio = torch.exp(new_log_probs - old_log_probs)
         
         # ============================================================
-        # STEP 2: Compute the two surrogate objectives
+        # STEP 2: Compute clipped ratio
+        # clip(r, 1-epsilon, 1+epsilon)
         # ============================================================
-        # Unclipped objective: r(θ) * A_t
-        # This is what vanilla policy gradient would maximize
-        surrogate1 = ratio * advantages
-        
-        # Clipped objective: clip(r(θ), 1-ε, 1+ε) * A_t
-        # This constrains how much the policy can change
         ratio_clipped = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon)
+        
+        # ============================================================
+        # STEP 3: Compute surrogate objectives
+        # L1 = r * A (unclipped)
+        # L2 = clip(r) * A (clipped)
+        # ============================================================
+        surrogate1 = ratio * advantages
         surrogate2 = ratio_clipped * advantages
         
         # ============================================================
-        # STEP 3: Take the minimum (pessimistic bound)
+        # STEP 4: Take minimum (pessimistic bound)
+        # L_policy = -min(L1, L2)
+        # Negative because we want to maximise, but optimisers minimise
         # ============================================================
-        # L^CLIP = E[min(surrogate1, surrogate2)]
-        #
-        # Why min()?
-        # - For good actions (A > 0): 
-        #   If ratio > 1+ε, we clip it. Don't increase probability too much!
-        # - For bad actions (A < 0):
-        #   If ratio < 1-ε, we clip it. Don't decrease probability too much!
-        #
-        # This creates a "trust region" without complex constrained optimization
         policy_loss = -torch.min(surrogate1, surrogate2).mean()
         
-        # Note the negative sign: we maximize the objective = minimize the negative
+        # ============================================================
+        # STEP 5: Value function loss
+        # L_value = (V(s) - R)^2
+        # ============================================================
+        if self.clip_value_loss:
+            # Clipped value loss (optional, can help stability)
+            value_clipped = old_values + torch.clamp(
+                new_values - old_values, -self.epsilon, self.epsilon
+            )
+            value_loss1 = (new_values - returns) ** 2
+            value_loss2 = (value_clipped - returns) ** 2
+            value_loss = 0.5 * torch.max(value_loss1, value_loss2).mean()
+        else:
+            value_loss = 0.5 * ((new_values - returns) ** 2).mean()
         
         # ============================================================
-        # STEP 4: Value function loss
+        # STEP 6: Entropy bonus (encourages exploration)
+        # L_entropy = -H(pi)
         # ============================================================
-        # The critic should predict returns accurately
-        # We use MSE: L_V = (V(s) - R)²
-        value_loss = 0.5 * ((values - returns) ** 2).mean()
+        entropy_loss = -entropy.mean()
         
         # ============================================================
-        # STEP 5: Entropy bonus
+        # STEP 7: Combine losses
+        # L_total = L_policy + c1 * L_value + c2 * L_entropy
         # ============================================================
-        # Entropy = -Σ p(a) log p(a)
-        # Higher entropy = more exploration
-        # We WANT high entropy early in training, so we ADD it as a bonus
-        # (with a small coefficient so it doesn't dominate)
-        entropy_loss = -entropy.mean()  # Negative because we want to maximize entropy
-        
-        # ============================================================
-        # STEP 6: Combine losses
-        # ============================================================
-        # Total loss = policy_loss + c1 * value_loss + c2 * entropy_loss
         total_loss = (
-            policy_loss + 
-            self.value_coef * value_loss + 
-            self.entropy_coef * entropy_loss
+            policy_loss 
+            + self.value_coef * value_loss 
+            + self.entropy_coef * entropy_loss
         )
         
-        # ============================================================
-        # STEP 7: Compute metrics for visualization/debugging
-        # ============================================================
+        # Compute additional metrics
         with torch.no_grad():
-            # What fraction of ratios were clipped?
-            # High early (policy wants to change a lot), low later (policy converging)
-            clipped = ((ratio < 1.0 - self.epsilon) | (ratio > 1.0 + self.epsilon)).float()
+            # Fraction of ratios that were clipped
+            clipped = (
+                (ratio < 1.0 - self.epsilon) | (ratio > 1.0 + self.epsilon)
+            ).float()
             clipped_fraction = clipped.mean().item()
             
-            # KL divergence: another measure of policy change
-            # KL(π_old || π_new) ≈ (log_prob_old - log_prob_new) * π_old
-            # For small changes: KL ≈ 0.5 * (ratio - 1)²
+            # Approximate KL divergence
+            # KL ≈ (r - 1) - log(r)
             approx_kl = ((ratio - 1.0) - torch.log(ratio)).mean().item()
             
-            # Explained variance: how well does value function predict returns?
-            # 1.0 = perfect prediction, 0.0 = no better than predicting mean
-            y_pred = values.detach().cpu().numpy()
-            y_true = returns.cpu().numpy()
-            var_y = np.var(y_true)
-            explained_var = 1 - np.var(y_true - y_pred) / (var_y + 1e-8)
+            # Explained variance
+            # How well does V(s) predict R?
+            var_returns = torch.var(returns)
+            if var_returns > 0:
+                explained_var = 1.0 - torch.var(returns - new_values) / var_returns
+                explained_var = explained_var.item()
+            else:
+                explained_var = 0.0
         
-        # Package metrics
         metrics = {
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
             'entropy': entropy.mean().item(),
+            'total_loss': total_loss.item(),
             'ratio_mean': ratio.mean().item(),
             'ratio_std': ratio.std().item(),
             'clipped_fraction': clipped_fraction,
@@ -301,82 +416,79 @@ class PPOAgent:
         
         return total_loss, metrics
     
-    def update(self):
+    def update(self, next_value: float = 0.0, next_done: bool = True) -> Dict[str, float]:
         """
-        Update the policy using collected experience
+        Perform PPO update using collected experience.
         
-        This is called after collecting a batch of trajectories.
+        This method:
+        1. Computes advantages using GAE
+        2. Normalises advantages (optional)
+        3. Runs multiple epochs of mini-batch updates
+        4. Decays epsilon (optional)
         
-        Key difference from vanilla policy gradient:
-        - Vanilla PG: Use data ONCE, then throw it away
-        - PPO: Use data MULTIPLE times (update_epochs times)
-        - Clipping makes this safe!
+        Args:
+            next_value: Value estimate of final state
+            next_done: Whether final state is terminal
         
-        Steps:
-        1. Compute advantages using GAE
-        2. Convert data to tensors
-        3. For multiple epochs:
-           a. Shuffle data
-           b. Update on minibatches
-        4. Clear storage
+        Returns:
+            Dictionary of average metrics from update
         """
-        # Check if we have data
-        if len(self.states) == 0:
-            return
+        if len(self.buffer) == 0:
+            return {}
         
-        # ============================================================
-        # STEP 1: Compute advantages
-        # ============================================================
-        # Get value of next state (for bootstrapping)
-        last_state = torch.FloatTensor(self.states[-1]).unsqueeze(0)
-        with torch.no_grad():
-            _, next_value = self.network(last_state)
-            next_value = next_value.item()
+        # Compute advantages and returns
+        advantages, returns = self.compute_gae(next_value, next_done)
         
-        # Compute GAE
-        advantages, returns = self.compute_gae(next_value)
+        # Convert to tensors
+        states = torch.FloatTensor(np.array(self.buffer.states)).to(self.device)
+        actions = torch.FloatTensor(np.array(self.buffer.actions)).to(self.device)
+        old_log_probs = torch.FloatTensor(np.array(self.buffer.log_probs)).to(self.device)
+        old_values = torch.FloatTensor(np.array(self.buffer.values)).to(self.device)
+        advantages_tensor = torch.FloatTensor(advantages).to(self.device)
+        returns_tensor = torch.FloatTensor(returns).to(self.device)
         
-        # Normalize advantages (common practice, improves stability)
-        # After normalization: mean ≈ 0, std ≈ 1
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Normalise advantages
+        if self.normalise_advantages:
+            advantages_tensor = (
+                (advantages_tensor - advantages_tensor.mean()) 
+                / (advantages_tensor.std() + 1e-8)
+            )
         
-        # Store for metrics
+        # Track metrics for this update
+        update_metrics = {
+            'policy_loss': [],
+            'value_loss': [],
+            'entropy': [],
+            'total_loss': [],
+            'ratio_mean': [],
+            'ratio_std': [],
+            'clipped_fraction': [],
+            'kl_divergence': [],
+            'explained_variance': []
+        }
+        
+        # Store advantage statistics
         self.metrics['advantages_mean'].append(advantages.mean())
         self.metrics['advantages_std'].append(advantages.std())
         
-        # ============================================================
-        # STEP 2: Convert to tensors
-        # ============================================================
-        states = torch.FloatTensor(np.array(self.states))
-        actions = torch.LongTensor(np.array(self.actions))
-        old_log_probs = torch.FloatTensor(np.array(self.log_probs))
-        advantages = torch.FloatTensor(advantages)
-        returns = torch.FloatTensor(returns)
-        
-        # ============================================================
-        # STEP 3: Multiple epochs of optimization
-        # ============================================================
-        # This is the key that allows PPO to be sample-efficient!
-        # We use the same data multiple times, but clipping keeps us safe
-        
         num_samples = states.shape[0]
-        num_batches = num_samples // self.batch_size
         
+        # Multiple epochs of updates
         for epoch in range(self.update_epochs):
-            # Shuffle indices for minibatch sampling
+            # Random permutation for mini-batches
             indices = np.random.permutation(num_samples)
             
-            # Iterate over minibatches
-            for i in range(num_batches):
-                # Get minibatch indices
-                batch_indices = indices[i * self.batch_size:(i + 1) * self.batch_size]
+            for start in range(0, num_samples, self.batch_size):
+                end = start + self.batch_size
+                batch_indices = indices[start:end]
                 
-                # Extract minibatch
+                # Get mini-batch
                 batch_states = states[batch_indices]
                 batch_actions = actions[batch_indices]
                 batch_old_log_probs = old_log_probs[batch_indices]
-                batch_advantages = advantages[batch_indices]
-                batch_returns = returns[batch_indices]
+                batch_advantages = advantages_tensor[batch_indices]
+                batch_returns = returns_tensor[batch_indices]
+                batch_old_values = old_values[batch_indices]
                 
                 # Compute loss
                 loss, metrics = self.compute_ppo_loss(
@@ -384,67 +496,162 @@ class PPOAgent:
                     batch_actions,
                     batch_old_log_probs,
                     batch_advantages,
-                    batch_returns
+                    batch_returns,
+                    batch_old_values
                 )
                 
                 # Gradient descent
-                self.optimizer.zero_grad()
+                self.optimiser.zero_grad()
                 loss.backward()
                 
-                # Clip gradients to prevent exploding gradients
-                # This is another stabilization technique
-                nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
+                # Gradient clipping
+                nn.utils.clip_grad_norm_(
+                    self.network.parameters(), 
+                    self.max_grad_norm
+                )
                 
-                self.optimizer.step()
+                self.optimiser.step()
                 
-                # Store metrics (only from last batch of last epoch for simplicity)
-                if epoch == self.update_epochs - 1 and i == num_batches - 1:
-                    for key, value in metrics.items():
-                        self.metrics[key].append(value)
+                # Track metrics
+                for key in update_metrics:
+                    update_metrics[key].append(metrics[key])
         
-        # ============================================================
-        # STEP 4: Clear storage for next batch
-        # ============================================================
-        self.clear_storage()
+        # Average metrics over all batches/epochs
+        avg_metrics = {key: np.mean(vals) for key, vals in update_metrics.items()}
+        
+        # Store in history
+        for key, val in avg_metrics.items():
+            self.metrics[key].append(val)
+        
+        # Decay epsilon
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        
+        # Clear buffer
+        self.buffer.clear()
+        
+        return avg_metrics
     
-    def clear_storage(self):
-        """Clear the experience buffer"""
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.values = []
-        self.log_probs = []
-        self.dones = []
-    
-    def get_metrics(self):
-        """Return metrics for logging/visualization"""
+    def get_metrics(self) -> Dict[str, List[float]]:
+        """Return all tracked metrics."""
         return self.metrics
-
-
-# Quick test
-if __name__ == "__main__":
-    from networks import ActorCritic
     
+    def save(self, filepath: str) -> None:
+        """
+        Save agent state to file.
+        
+        Args:
+            filepath: Path to save file
+        """
+        torch.save({
+            'network_state_dict': self.network.state_dict(),
+            'optimiser_state_dict': self.optimiser.state_dict(),
+            'epsilon': self.epsilon,
+            'metrics': self.metrics
+        }, filepath)
+    
+    def load(self, filepath: str) -> None:
+        """
+        Load agent state from file.
+        
+        Args:
+            filepath: Path to load file
+        """
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.network.load_state_dict(checkpoint['network_state_dict'])
+        self.optimiser.load_state_dict(checkpoint['optimiser_state_dict'])
+        self.epsilon = checkpoint['epsilon']
+        self.metrics = checkpoint['metrics']
+
+
+def test_ppo_agent():
+    """Test the PPO agent implementation."""
     print("Testing PPO Agent...")
+    print("=" * 60)
     
-    # Create network and agent
-    network = ActorCritic(state_dim=4, action_dim=2)
-    agent = PPOAgent(network, epsilon=0.2)
+    # Create agent
+    state_dim = 8
+    action_dim = 1
     
-    # Simulate collecting some data
-    for _ in range(10):
-        state = np.random.randn(4)
-        action = np.random.randint(0, 2)
+    agent = PPOAgent(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_low=0.0,
+        action_high=5.0,
+        hidden_dim=64,
+        lr=3e-4,
+        gamma=0.99,
+        gae_lambda=0.95,
+        epsilon=0.2,
+        update_epochs=4,
+        batch_size=32
+    )
+    
+    print(f"\nAgent created:")
+    print(f"  State dim: {state_dim}")
+    print(f"  Action dim: {action_dim}")
+    print(f"  Action range: [{agent.action_low}, {agent.action_high}]")
+    print(f"  Epsilon: {agent.epsilon}")
+    
+    # Test action selection
+    print("\nTesting action selection...")
+    test_state = np.random.randn(state_dim).astype(np.float32)
+    
+    action, log_prob, value = agent.get_action(test_state, deterministic=False)
+    print(f"  Stochastic action: {action}")
+    print(f"  Log prob: {log_prob:.4f}")
+    print(f"  Value: {value:.4f}")
+    
+    action_det, _, _ = agent.get_action(test_state, deterministic=True)
+    print(f"  Deterministic action: {action_det}")
+    
+    # Test rollout and update
+    print("\nTesting rollout buffer and update...")
+    
+    # Simulate a rollout
+    num_steps = 128
+    for _ in range(num_steps):
+        state = np.random.randn(state_dim).astype(np.float32)
+        action, log_prob, value = agent.get_action(state)
         reward = np.random.randn()
-        value = np.random.randn()
-        log_prob = np.random.randn()
-        done = False
+        done = np.random.random() < 0.01
         
         agent.store_transition(state, action, reward, value, log_prob, done)
     
-    # Test update
-    print(f"Stored {len(agent.states)} transitions")
-    agent.update()
-    print("Update completed successfully!")
+    print(f"  Buffer size: {len(agent.buffer)}")
     
-    print("\n✓ PPO Agent tests passed!")
+    # Perform update
+    update_metrics = agent.update(next_value=0.0, next_done=True)
+    
+    print(f"\n  Update metrics:")
+    print(f"    Policy loss: {update_metrics['policy_loss']:.4f}")
+    print(f"    Value loss: {update_metrics['value_loss']:.4f}")
+    print(f"    Entropy: {update_metrics['entropy']:.4f}")
+    print(f"    Clipped fraction: {update_metrics['clipped_fraction']:.3f}")
+    print(f"    KL divergence: {update_metrics['kl_divergence']:.4f}")
+    
+    print(f"\n  Buffer size after update: {len(agent.buffer)}")
+    
+    # Test save/load
+    print("\nTesting save/load...")
+    import tempfile
+    import os
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filepath = os.path.join(tmpdir, "test_agent.pt")
+        agent.save(filepath)
+        print(f"  Saved to {filepath}")
+        
+        # Create new agent and load
+        new_agent = PPOAgent(state_dim, action_dim)
+        new_agent.load(filepath)
+        print(f"  Loaded successfully")
+        
+        # Check epsilon was restored
+        print(f"  Restored epsilon: {new_agent.epsilon}")
+    
+    print("\n" + "=" * 60)
+    print("✓ All PPO agent tests passed!")
+
+
+if __name__ == "__main__":
+    test_ppo_agent()
