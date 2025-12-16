@@ -80,16 +80,16 @@ class PPOTrainer:
         }
         
         self.agent_config = agent_config or {
-            'hidden_dim': 64,
-            'lr': 3e-4,
-            'gamma': 0.99,
-            'gae_lambda': 0.95,
-            'epsilon': 0.2,
-            'value_coef': 0.5,
-            'entropy_coef': 0.01,
-            'max_grad_norm': 0.5,
-            'update_epochs': 10,
-            'batch_size': 64
+        'hidden_dim': 64,
+        'lr': 1e-4,           # Reduced from 3e-4
+        'gamma': 0.99,
+        'gae_lambda': 0.95,
+        'epsilon': 0.1,       # More conservative, was 0.2
+        'value_coef': 0.5,
+        'entropy_coef': 0.01,
+        'max_grad_norm': 0.5,
+        'update_epochs': 4,   # Reduced from 10
+        'batch_size': 64
         }
         
         # Training parameters

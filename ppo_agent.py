@@ -433,27 +433,30 @@ class PPOAgent:
         Returns:
             Dictionary of average metrics from update
         """
-        if len(self.buffer) == 0:
-            return {}
-        
-        # Compute advantages and returns
-        advantages, returns = self.compute_gae(next_value, next_done)
-        
-        # Convert to tensors
-        states = torch.FloatTensor(np.array(self.buffer.states)).to(self.device)
-        actions = torch.FloatTensor(np.array(self.buffer.actions)).to(self.device)
-        old_log_probs = torch.FloatTensor(np.array(self.buffer.log_probs)).to(self.device)
-        old_values = torch.FloatTensor(np.array(self.buffer.values)).to(self.device)
-        advantages_tensor = torch.FloatTensor(advantages).to(self.device)
-        returns_tensor = torch.FloatTensor(returns).to(self.device)
-        
-        # Normalise advantages
-        if self.normalise_advantages:
-            advantages_tensor = (
-                (advantages_tensor - advantages_tensor.mean()) 
-                / (advantages_tensor.std() + 1e-8)
-            )
-        
+    if len(self.buffer) == 0:
+        return {}
+    
+    # Compute advantages and returns
+    advantages, returns = self.compute_gae(next_value, next_done)
+    
+    # Convert to tensors
+    states = torch.FloatTensor(np.array(self.buffer.states)).to(self.device)
+    actions = torch.FloatTensor(np.array(self.buffer.actions)).to(self.device)
+    old_log_probs = torch.FloatTensor(np.array(self.buffer.log_probs)).to(self.device)
+    old_values = torch.FloatTensor(np.array(self.buffer.values)).to(self.device)
+    advantages_tensor = torch.FloatTensor(advantages).to(self.device)
+    returns_tensor = torch.FloatTensor(returns).to(self.device)
+    
+    # ========== FIX: Normalise returns as well ==========
+    returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + 1e-8)
+    
+    # Normalise advantages
+    if self.normalise_advantages:
+        advantages_tensor = (
+            (advantages_tensor - advantages_tensor.mean()) 
+            / (advantages_tensor.std() + 1e-8)
+        )
+    
         # Track metrics for this update
         update_metrics = {
             'policy_loss': [],

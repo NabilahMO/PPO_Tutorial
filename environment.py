@@ -331,58 +331,45 @@ class GlucoseInsulinEnv(gym.Env):
     
     def _compute_reward(self) -> float:
         """
-        Compute reward based on current glucose level.
-        
-        Zone-based reward function from Zhu et al. (2020):
-        - Rewards for being in target range
-        - Asymmetric penalties (hypoglycaemia penalised more)
-        - Additional penalties for glucose rate of change
-        
-        Returns:
-            Reward value for current time step
+    Compute reward based on current glucose level.
+    
+    SCALED DOWN by factor of 10 for training stability.
         """
-        G = self.glucose
-        
-        # Zone-based reward (from research literature)
-        if G < 40:
-            # Severe hypoglycaemia - DANGEROUS
-            base_reward = -6.0
-        elif G < 54:
-            # Severe hypoglycaemia level 2
-            base_reward = -4.0
-        elif G < 70:
-            # Hypoglycaemia level 1
-            base_reward = -2.0
-        elif G <= 180:
-            # Target range - IDEAL
-            # Bonus for being closer to centre (120 mg/dL)
-            centre_bonus = 1.0 - 0.5 * abs(G - 120.0) / 60.0
-            base_reward = 1.0 + max(0.0, centre_bonus * 0.5)
-        elif G <= 250:
-            # Mild hyperglycaemia
-            base_reward = -0.5
-        elif G <= 400:
-            # Hyperglycaemia
-            base_reward = -1.0
-        else:
-            # Severe hyperglycaemia
-            base_reward = -2.0
-        
-        # Rate of change penalty (stability reward)
-        if len(self.glucose_history) >= 1:
-            glucose_change = abs(self.glucose - self.glucose_history[-1])
-            # Penalise rapid changes (> 2 mg/dL per 5 min is concerning)
-            rate_penalty = -0.1 * max(0.0, glucose_change - 2.0) / 10.0
-        else:
-            rate_penalty = 0.0
-        
-        # Insulin efficiency penalty (prefer minimal effective dose)
-        insulin_penalty = -0.01 * self.iob / 10.0
-        
-        # Total reward
-        reward = base_reward + rate_penalty + insulin_penalty
-        
-        return reward
+    G = self.glucose
+    
+    # Zone-based rewards (SCALED DOWN)
+    if G < 54:
+        base_reward = -0.4  # Was -4.0
+    elif G < 70:
+        base_reward = -0.2  # Was -2.0
+    elif G <= 180:
+        base_reward = 0.1   # Was +1.0
+    elif G <= 250:
+        base_reward = -0.05 # Was -0.5
+    elif G <= 400:
+        base_reward = -0.1  # Was -1.0
+    else:
+        base_reward = -0.2  # Was -2.0
+    
+    # Bonus for being near centre of target (scaled)
+    if 100 <= G <= 140:
+        base_reward += 0.05  # Was +0.5
+    
+    # Rate of change penalty (scaled)
+    if len(self.glucose_history) >= 2:
+        dG = abs(self.glucose - self.glucose_history[-2])
+        rate_penalty = -0.01 * max(0, dG - 2) / 10  # Was -0.1
+        base_reward += rate_penalty
+    
+    # Insulin usage penalty (scaled)
+    iob_penalty = -0.001 * self.insulin_on_board / 10  # Was -0.01
+    base_reward += iob_penalty
+    
+    # Severe hypoglycaemia termination penalty (scaled)
+    if G < 40:
+        base_reward -= 1.0  # Was -10.0
+    
+    return base_reward
     
     def reset(
         self,
