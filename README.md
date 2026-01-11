@@ -495,7 +495,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgements
 
-- Anthropic Claude for assistance with code development
+- LLM for assistance with code development
 - OpenAI for the original PPO paper
 - The diabetes research community for clinical guidelines and reward function design
 
