@@ -133,7 +133,7 @@ def experiment_command(args):
 
 def visualise_command(args):
     """Generate visualisations."""
-    from visualise import generate_all_visualisations, PPOVisualiser
+    from visualise_simple import generate_all_visualisations, PPOVisualiser
     
     print("\n" + "=" * 60)
     print("PPO GLUCOSE CONTROL - VISUALISATION")
@@ -187,7 +187,7 @@ def quick_start_command(args):
     results = trainer.train()
     
     # Generate visualisations
-    from visualise import generate_all_visualisations
+    from visualise_simple import generate_all_visualisations
     
     generate_all_visualisations(results['save_dir'])
     

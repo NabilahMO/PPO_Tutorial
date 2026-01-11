@@ -39,7 +39,7 @@ from evaluate import (
     EvaluationResult,
     compare_controllers
 )
-from visualise import PPOVisualiser
+from visualise_simple import PPOVisualiser
 
 
 @dataclass

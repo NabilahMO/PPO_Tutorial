@@ -1,0 +1,25 @@
+{
+  "env_config": {
+    "max_insulin_dose": 5.0,
+    "episode_length_hours": 24.0,
+    "sample_time_minutes": 5.0,
+    "target_glucose_min": 70.0,
+    "target_glucose_max": 180.0,
+    "patient_variability": true,
+    "meal_variability": true
+  },
+  "agent_config": {
+    "hidden_dim": 64,
+    "lr": 0.0001,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "epsilon": 0.1,
+    "value_coef": 0.5,
+    "entropy_coef": 0.01,
+    "max_grad_norm": 0.5,
+    "update_epochs": 4,
+    "batch_size": 64
+  },
+  "total_timesteps": 100000,
+  "seed": 42
+}
