@@ -469,22 +469,6 @@ Key parameters to tune in `ppo_agent.py`:
 ### Pharmacokinetic Modelling
 
 6. Bergman, R. N., Ider, Y. Z., Bowden, C. R., & Cobelli, C. (1979). **Quantitative Estimation of Insulin Sensitivity**. American Journal of Physiology.
-
----
-
-## Citation
-
-If you use this code in your research, please cite:
-```bibtex
-@misc{ppo-glucose-control,
-  author = {Your Name},
-  title = {PPO for Glucose Control in Type 1 Diabetes},
-  year = {2024},
-  publisher = {GitHub},
-  url = {https://github.com/yourusername/ppo-glucose-control}
-}
-```
-
 ---
 
 ## License
