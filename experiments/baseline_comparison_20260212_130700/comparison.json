@@ -1,0 +1,76 @@
+{
+  "controllers": [
+    "PPO Agent",
+    "Fixed Basal (1.0 U/hr)",
+    "Basal-Bolus Therapy",
+    "Rule-Based Controller",
+    "PID Controller"
+  ],
+  "summaries": [
+    {
+      "name": "PPO Agent",
+      "mean_reward": -5.4911807952038725,
+      "std_reward": 0.0,
+      "mean_tir": 60.24221453287197,
+      "std_tir": 0.0,
+      "mean_tbr": 39.75778546712803,
+      "mean_tar": 0.0,
+      "mean_glucose": 74.05391988928264,
+      "mean_cv": 12.762196326766938,
+      "mean_insulin": 22.09215627412001,
+      "num_episodes": 1
+    },
+    {
+      "name": "Fixed Basal (1.0 U/hr)",
+      "mean_reward": -2.692779532137945,
+      "std_reward": 0.0,
+      "mean_tir": 63.49480968858131,
+      "std_tir": 0.0,
+      "mean_tbr": 36.50519031141868,
+      "mean_tar": 0.0,
+      "mean_glucose": 74.71535608732027,
+      "mean_cv": 12.130102086024564,
+      "mean_insulin": 24.0,
+      "num_episodes": 1
+    },
+    {
+      "name": "Basal-Bolus Therapy",
+      "mean_reward": 22.439188397792414,
+      "std_reward": 0.0,
+      "mean_tir": 92.28373702422145,
+      "std_tir": 0.0,
+      "mean_tbr": 7.716262975778548,
+      "mean_tar": 0.0,
+      "mean_glucose": 79.93462415355377,
+      "mean_cv": 10.3699172991978,
+      "mean_insulin": 19.199999999999996,
+      "num_episodes": 1
+    },
+    {
+      "name": "Rule-Based Controller",
+      "mean_reward": 29.707314608585712,
+      "std_reward": 0.0,
+      "mean_tir": 100.0,
+      "std_tir": 0.0,
+      "mean_tbr": 0.0,
+      "mean_tar": 0.0,
+      "mean_glucose": 91.80930018067897,
+      "mean_cv": 6.558516327708928,
+      "mean_insulin": 10.469350790480771,
+      "num_episodes": 1
+    },
+    {
+      "name": "PID Controller",
+      "mean_reward": 29.757357750691845,
+      "std_reward": 0.0,
+      "mean_tir": 100.0,
+      "std_tir": 0.0,
+      "mean_tbr": 0.0,
+      "mean_tar": 0.0,
+      "mean_glucose": 93.06398776780678,
+      "mean_cv": 6.133807549624337,
+      "mean_insulin": 9.677282223602134,
+      "num_episodes": 1
+    }
+  ]
+}

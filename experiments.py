@@ -39,7 +39,7 @@ from evaluate import (
     EvaluationResult,
     compare_controllers
 )
-from visualise_simple import PPOVisualiser
+# # from visualise_simple import PPOVisualiser  # Removed - not needed  # Not needed
 
 
 @dataclass
@@ -576,7 +576,14 @@ class PPOExperiment:
             [EvaluationResult(
                 name=r['name'],
                 rewards=[r['mean_reward']],
-                clinical_metrics=[r],
+                clinical_metrics=[{
+                    'time_in_range': r.get('mean_tir', 0),
+                    'time_below_range': r.get('mean_tbr', 0),
+                    'time_above_range': r.get('mean_tar', 0),
+                    'mean_glucose': r.get('mean_glucose', 0),
+                    'glucose_cv': r.get('mean_cv', 0),
+                    'total_insulin': r.get('mean_insulin', 0)
+                }],
                 glucose_traces=[],
                 insulin_traces=[]
             ) for r in results],
@@ -679,23 +686,7 @@ class PPOExperiment:
         save_dir: str
     ) -> None:
         """Generate visualisations for epsilon experiment."""
-        vis = PPOVisualiser(save_dir=save_dir)
-        
-        # Prepare data for epsilon comparison plot
-        epsilon_data = {}
-        for epsilon, data in results.items():
-            epsilon_data[epsilon] = {
-                'episode_rewards': data['episode_rewards'],
-                'clinical_metrics': data['clinical_metrics']
-            }
-        
-        vis.plot_epsilon_comparison(
-            experiment_results=epsilon_data,
-            title="Effect of Clipping Parameter ε on Learning",
-            filename="epsilon_comparison.png"
-        )
-        
-        # Additional detailed plots
+        # Generate plots directly without PPOVisualiser
         self._plot_epsilon_learning_curves(results, save_dir)
         self._plot_epsilon_clinical_comparison(results, save_dir)
     
