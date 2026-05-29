@@ -8,7 +8,7 @@
 
 This project demonstrates how reinforcement learning can be applied to biomedical control problems, specifically maintaining blood glucose within a safe therapeutic range (70-180 mg/dL) whilst avoiding dangerous hypoglycaemia.
 
-![PPO Clipped Objective](figures/04_clipped_objective.png)
+ [![Article](https://img.shields.io/badge/Article-green.svg)](https://medium.com/@nmokunola/building-an-ai-pancreas-a-tutorial-on-ppo-for-glucose-control-db957136a610)
 
 ---
 
