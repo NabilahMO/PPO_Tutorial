@@ -24,6 +24,7 @@ This project demonstrates how reinforcement learning can be applied to biomedica
 - [Experiments](#experiments)
 - [Results](#results)
 - [References](#references)
+- Feedback from Imperial College London's Reinforcement Learning Module Lead - Faraz Janan
 
 ---
 
@@ -488,4 +489,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Contact
 
 For questions or suggestions, please open an issue or contact [nmokunola@icloud.com].
+
+## Feedback 
+Feedback from Imperial College London's Reinforcement Learning Module Lead - Faraz Janan
+<img width="1321" height="598" alt="rl cw feedback " src="https://github.com/user-attachments/assets/3bdfba61-d693-430e-8dae-4fee32707d7f" />
 
